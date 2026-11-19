@@ -8,7 +8,7 @@ import { isTauInVideoRange } from '../core/timeline.ts';
 import { renderComparisonFrame, ComparisonRenderState } from '../core/renderer.ts';
 import { SynthesizedMetronome } from '../core/metronome.ts';
 import { DualVideoSyncEngine } from '../core/sync-engine.ts';
-import type { LoadedVideoItem } from './ImportStep.tsx';
+import type { LoadedVideoItem } from '../types/media.ts';
 import { VideoExporter, ExportProgressInfo } from '../core/exporter.ts';
 import { isNativeAndroid } from '../core/nativeMedia.ts';
 
@@ -71,6 +71,7 @@ export const ExportPage: React.FC<ExportPageProps> = ({
   const [draggingHandle, setDraggingHandle] = useState<'A' | 'B' | null>(null);
 
   const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [exportResolution, setExportResolution] = useState<'720p' | '1080p'>('720p');
   const [progress, setProgress] = useState<ExportProgressInfo>({
     currentFrame: 0,
     totalFrames: 100,
@@ -91,6 +92,15 @@ export const ExportPage: React.FC<ExportPageProps> = ({
   }, [downloadUrl]);
 
   const exporterRef = useRef<VideoExporter | null>(null);
+
+  // 卸载时释放节拍器底层 AudioContext：浏览器/WebView 对并发 AudioContext 存在
+  // 硬上限（约 6 个），缺失该清理会在多次进出导出页后令节拍器永久静音。
+  useEffect(() => {
+    return () => {
+      metronomeRef.current.dispose();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const trackRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<DualVideoSyncEngine | null>(null);
@@ -170,9 +180,15 @@ export const ExportPage: React.FC<ExportPageProps> = ({
     initialViewport,
     triLineTransform,
     timeline,
-    video1,
-    video2,
+    video1.width,
+    video1.height,
+    video1.geometry.triLine,
+    video2.width,
+    video2.height,
+    video2.geometry.triLine,
   ]);
+  // 依赖按实际读取字段收窄（video1/video2 整体身份变化会无谓重建绘制回调）
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 
   // 初始化并连接 DualVideoSyncEngine 驱动预览（直接复用对比台共享视频节点）
   useEffect(() => {
@@ -270,6 +286,8 @@ export const ExportPage: React.FC<ExportPageProps> = ({
       engine.destroy();
       engineRef.current = null;
     };
+    // 依赖按实际读取字段收窄：App 层 audioInfo 等无关更新不应整建引擎与渲染循环
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sharedVideo1Ref,
     sharedVideo2Ref,
@@ -280,8 +298,14 @@ export const ExportPage: React.FC<ExportPageProps> = ({
     initialViewport,
     triLineTransform,
     timeline,
-    video1,
-    video2,
+    video1.url,
+    video1.width,
+    video1.height,
+    video1.geometry.triLine,
+    video2.url,
+    video2.width,
+    video2.height,
+    video2.geometry.triLine,
   ]);
 
   // 当截取区间 A-B 变化时同步更新循环边界
@@ -340,10 +364,12 @@ export const ExportPage: React.FC<ExportPageProps> = ({
     [seekPreview]
   );
 
-  // 播放 / 暂停切换 (统一走会合屏障)
+  // 播放 / 暂停切换 (统一走会合屏障；无真实重叠区间时禁止起播)
   const togglePreviewPlay = () => {
     if (isPreviewPlaying) {
       engineRef.current?.pause();
+    } else if (!timeline.hasOverlap) {
+      return;
     } else {
       if (initialSoundSource === 'metronome') {
         metronomeRef.current.reset(previewTauRef.current, timeline.effectiveBpm);
@@ -429,9 +455,15 @@ export const ExportPage: React.FC<ExportPageProps> = ({
   };
 
   /**
-   * 启动 A-B 区间合成导出（现代 WebCodecs MP4 或老旧 WebView 兼容 MediaRecorder WebM）
+   * 启动 A-B 区间合成导出
+   * Android 原生端走 MediaCodec/OpenGL 硬件管线；Web 端要求 WebCodecs 支持，
+   * 不支持时直接报错（无 MediaRecorder 降级路径）。
    */
   const handleStartExport = async () => {
+    if (!timeline.hasOverlap) {
+      setErrorMsg('双视频有效区间无重叠，无法导出。请回到标定步骤调整截取区间或锚点。');
+      return;
+    }
     ensureStopped();
     setIsExporting(true);
     setErrorMsg(null);
@@ -461,8 +493,8 @@ export const ExportPage: React.FC<ExportPageProps> = ({
       slowMotionRate: initialRate,
       soundSource: initialSoundSource,
       fps: 30,
-      width: 1280,
-      height: 720,
+      width: exportResolution === '1080p' ? 1920 : 1280,
+      height: exportResolution === '1080p' ? 1080 : 720,
       onProgress: (info) => setProgress(info),
     });
     exporterRef.current = exporter;
@@ -545,9 +577,11 @@ export const ExportPage: React.FC<ExportPageProps> = ({
           <span className="tag-badge">
             {initialMode === 'overlay' ? '半透明叠加' : '左右分区'}
           </span>
-          <span className="tag-badge">{initialRate}x</span>
-          <span className="tag-badge">{soundLabel}</span>
-          <span className="tag-badge">1280×720 · MP4</span>
+              <span className="tag-badge">{initialRate}x</span>
+              <span className="tag-badge">{soundLabel}</span>
+              <span className="tag-badge">
+                {exportResolution === '1080p' ? '1920×1080' : '1280×720'} · MP4
+              </span>
         </div>
       </div>
 
@@ -815,6 +849,34 @@ export const ExportPage: React.FC<ExportPageProps> = ({
                 </div>
               </div>
             </div>
+
+            {/* 导出分辨率选择（码率随分辨率自适应：720p 5Mbps / 1080p 8Mbps） */}
+            <div
+              className="fx-row-8"
+              style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+            >
+              <span className="mono-muted" style={{ fontSize: '11px' }}>导出分辨率</span>
+              <div className="seg-group">
+                <button
+                  type="button"
+                  onClick={() => setExportResolution('720p')}
+                  disabled={isExporting}
+                  className={`seg-btn mono-num ${exportResolution === '720p' ? 'active' : ''}`}
+                  style={{ padding: '0 6px', fontSize: '11px' }}
+                >
+                  720p
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExportResolution('1080p')}
+                  disabled={isExporting}
+                  className={`seg-btn mono-num ${exportResolution === '1080p' ? 'active' : ''}`}
+                  style={{ padding: '0 6px', fontSize: '11px' }}
+                >
+                  1080p
+                </button>
+              </div>
+            </div>
           </div>
 
           {/* 固定底部进度与导出按钮区 */}
@@ -895,6 +957,8 @@ export const ExportPage: React.FC<ExportPageProps> = ({
                 type="button"
                 onClick={handleStartExport}
                 className="btn btn-accent"
+                disabled={!timeline.hasOverlap}
+                title={timeline.hasOverlap ? undefined : '双视频有效区间无重叠，无法导出'}
                 style={{ height: '30px', width: '100%', fontSize: '12px' }}
               >
                 <Download size={13} />

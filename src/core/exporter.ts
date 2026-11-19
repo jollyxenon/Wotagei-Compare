@@ -2,6 +2,8 @@
  * 所见即所得离线逐帧视频导出与音频混流引擎
  * Android 原生端：通过 NativeMediaPlugin 调用 MediaCodec + OpenGL ES + MediaMuxer GPU 零拷贝离线硬编码 MP4
  * 现代 Web 浏览器端：基于 WebCodecs (VideoEncoder/AudioEncoder) 与 mp4-muxer 执行确定性时间戳离线编码 MP4
+ * 注意：纯 Web 通道对宿主有 WebCodecs 硬性要求，无 MediaRecorder 实时录制降级路径
+ * （历史上曾有该降级，后随架构演进移除）；不支持时直接抛错并提示改用原生客户端。
  */
 
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
@@ -14,6 +16,7 @@ import type {
   SlowMotionRate,
   SoundSource,
 } from '../types/timeline.ts';
+import type { LoadedVideoItem } from '../types/media.ts';
 import type { AlignmentTransform } from './geometry.ts';
 import type { UnifiedTimelineResult } from './timeline.ts';
 import { mapTauToSourceTime, isTauInVideoRange } from './timeline.ts';
@@ -23,8 +26,8 @@ import {
 } from './renderer.ts';
 import type { ComparisonRenderState } from './renderer.ts';
 import { isDownbeatIndex } from './metronome.ts';
+import { getPcm } from './pcmStore.ts';
 import { NativeMedia, isNativeAndroid } from './nativeMedia.ts';
-import type { LoadedVideoItem } from '../components/ImportStep.tsx';
 
 export interface ExportProgressInfo {
   currentFrame: number;
@@ -65,6 +68,13 @@ export function isWebCodecsSupported(): boolean {
 }
 
 /**
+ * 按导出分辨率选择匹配的视频码率（bps）
+ */
+function selectVideoBitrate(width: number, height: number): number {
+  return width * height >= 1920 * 1080 ? 8_000_000 : 5_000_000;
+}
+
+/**
  * 寻找宿主环境支持的最佳 H.264 视频编码配置
  */
 async function selectSupportedVideoCodec(width: number, height: number, fps: number): Promise<string> {
@@ -80,7 +90,7 @@ async function selectSupportedVideoCodec(width: number, height: number, fps: num
         codec,
         width,
         height,
-        bitrate: 4_000_000,
+        bitrate: selectVideoBitrate(width, height),
         framerate: fps,
       });
       if (support.supported) {
@@ -482,7 +492,7 @@ export class VideoExporter {
             ? targetVideo.audioInfo.anchorTime
             : 1.0;
         const rate = soundSource === 'video1' ? timeline.rate1 : timeline.rate2;
-        const rawPcm = targetVideo.audioInfo?.rawChannelData;
+        const rawPcm = getPcm(targetVideo.url);
 
         if (rawPcm && rawPcm.length > 0) {
           audioBuffer = createSourceAudioBuffer(
@@ -534,7 +544,7 @@ export class VideoExporter {
       codec: selectedVideoCodec,
       width: exportWidth,
       height: exportHeight,
-      bitrate: 5_000_000,
+      bitrate: selectVideoBitrate(exportWidth, exportHeight),
       framerate: fps,
     });
 
@@ -605,19 +615,38 @@ export class VideoExporter {
       }),
     ]);
 
+    // 带超时的寻道：老旧/损坏媒体源可能永不触发 seeked 事件，
+    // 若不设硬上限，整个导出循环将永久卡死且无法取消。
+    const SEEK_TIMEOUT_MS = 5000;
     const seekVideo = (v: HTMLVideoElement, targetTime: number): Promise<void> => {
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
         const clamped = Math.max(0, Math.min(v.duration || targetTime, targetTime));
         if (Math.abs(v.currentTime - clamped) < 0.01) {
           resolve();
           return;
         }
-        const onSeeked = () => {
+        let settled = false;
+        const finish = (err?: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
           v.removeEventListener('seeked', onSeeked);
-          resolve();
+          v.removeEventListener('error', onError);
+          if (err) reject(err);
+          else resolve();
         };
+        const timer = setTimeout(() => {
+          finish(new Error(`视频寻道超时 (${SEEK_TIMEOUT_MS}ms)，媒体源可能已损坏或解码器停滞`));
+        }, SEEK_TIMEOUT_MS);
+        const onSeeked = () => finish();
+        const onError = () => finish(new Error('导出寻道过程中发生媒体解码错误'));
         v.addEventListener('seeked', onSeeked);
-        v.currentTime = clamped;
+        v.addEventListener('error', onError);
+        try {
+          v.currentTime = clamped;
+        } catch (e) {
+          finish(e instanceof Error ? e : new Error(String(e)));
+        }
       });
     };
 
@@ -626,7 +655,9 @@ export class VideoExporter {
 
     const frameDurationMicros = Math.round((1 / fps) * 1_000_000);
 
-    for (let frame = 0; frame < totalFrames; frame++) {
+    // 逐帧循环任何一步失败（含寻道超时）都必须释放离屏视频节点，避免解码器句柄泄漏
+    try {
+      for (let frame = 0; frame < totalFrames; frame++) {
       if (this.isCancelled) {
         videoEncoder.close();
         throw new Error('用户已取消导出');
@@ -691,6 +722,13 @@ export class VideoExporter {
         });
         await new Promise((r) => setTimeout(r, 0));
       }
+      }
+    } finally {
+      // 无论成功、取消还是寻道超时失败，都立即释放离屏视频解码节点
+      offVideo1.removeAttribute('src');
+      offVideo1.load();
+      offVideo2.removeAttribute('src');
+      offVideo2.load();
     }
 
     await videoEncoder.flush();
@@ -699,11 +737,6 @@ export class VideoExporter {
     muxer.finalize();
     const finalBuffer = muxer.target.buffer;
     const finalBlob = new Blob([finalBuffer], { type: 'video/mp4' });
-
-    offVideo1.removeAttribute('src');
-    offVideo1.load();
-    offVideo2.removeAttribute('src');
-    offVideo2.load();
 
     onProgress({
       currentFrame: totalFrames,

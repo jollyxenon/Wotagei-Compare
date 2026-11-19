@@ -1,24 +1,12 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { Film, Upload, ArrowRight, CheckCircle2, Loader2 } from 'lucide-react';
+import { Film, Upload, ArrowRight, CheckCircle2, Loader2, AlertTriangle } from 'lucide-react';
 import type { VideoGeometryConfig } from '../types/geometry.ts';
 import type { VideoAudioInfo } from '../types/timeline.ts';
-import { decodeAudioFromFile, decodeAudioFromNativePcmUrl } from '../core/audio.ts';
+import { DEFAULT_BPM } from '../types/timeline.ts';
+import type { LoadedVideoItem } from '../types/media.ts';
+import { decodeAudioFromFile, decodeAudioFromNativePcmUrl } from '../core/audio-dom.ts';
+import { dropPcm, putPcm } from '../core/pcmStore.ts';
 import { NativeMedia, isNativeAndroid } from '../core/nativeMedia.ts';
-
-/** 已载入的单通道视频数据结构 */
-export interface LoadedVideoItem {
-  file?: File;
-  nativeUri?: string;
-  url: string;
-  name: string;
-  duration: number;
-  width: number;
-  height: number;
-  geometry: VideoGeometryConfig;
-  audioInfo?: VideoAudioInfo;
-  spatialTouched?: boolean;
-  audioAnchorTouched?: boolean;
-}
 
 interface ImportStepProps {
   initialVideo1?: LoadedVideoItem | null;
@@ -34,7 +22,8 @@ interface ImportStepProps {
 
 /**
  * 安全探测视频的真实分辨率与时长
- * 具备 DOM 挂载注入、playsinline 与 2.5 秒硬超时保底能力
+ * 具备 DOM 挂载注入、playsinline 与 2.5 秒硬超时保底能力。
+ * 探测失败/超时时返回 0（未知哨兵），绝不伪造 1920×1080 / 10s 等假数据。
  */
 function probeVideoMetadata(
   url: string,
@@ -64,25 +53,28 @@ function probeVideoMetadata(
       resolve(result);
     };
 
-    // 2.5 秒超时硬兜底：若老旧内核或特殊编码迟迟未触发事件，直接回退标准 1080p，绝不阻断用户
+    // 2.5 秒超时硬兜底：若老旧内核或特殊编码迟迟未触发事件，保留已知的部分字段，
+    // 其余返回 0（未知），绝不阻断用户流程
     const timer = setTimeout(() => {
-      const fallbackW = video.videoWidth > 0 ? video.videoWidth : 1920;
-      const fallbackH = video.videoHeight > 0 ? video.videoHeight : 1080;
-      const fallbackDur = !isNaN(video.duration) && video.duration > 0 ? video.duration : 10;
-      finish({ width: fallbackW, height: fallbackH, duration: fallbackDur });
+      finish({
+        width: video.videoWidth > 0 ? video.videoWidth : 0,
+        height: video.videoHeight > 0 ? video.videoHeight : 0,
+        duration: !isNaN(video.duration) && video.duration > 0 ? video.duration : 0,
+      });
     }, 2500);
 
     const onReady = () => {
-      const w = video.videoWidth || 1920;
-      const h = video.videoHeight || 1080;
-      const dur = !isNaN(video.duration) && video.duration > 0 ? video.duration : 10;
-      finish({ width: w, height: h, duration: dur });
+      finish({
+        width: video.videoWidth > 0 ? video.videoWidth : 0,
+        height: video.videoHeight > 0 ? video.videoHeight : 0,
+        duration: !isNaN(video.duration) && video.duration > 0 ? video.duration : 0,
+      });
     };
 
     video.onloadedmetadata = onReady;
     video.oncanplay = onReady;
     video.onerror = () => {
-      finish({ width: 1920, height: 1080, duration: 10 });
+      finish({ width: 0, height: 0, duration: 0 });
     };
 
     video.src = url;
@@ -98,6 +90,25 @@ function probeVideoMetadata(
       video.load();
     } catch {}
   });
+}
+
+/**
+ * 构造显式标记为降级的音频占位信息（解析失败 / 无音轨 / 超限）
+ * duration 允许为 0（未知），由调用方保证最终落到真实元数据时长
+ */
+function buildDegradedAudioInfo(duration: number): VideoAudioInfo {
+  return {
+    duration,
+    sampleRate: 16000,
+    hasAudioTrack: false,
+    audioDegraded: true,
+    detectedBpm: DEFAULT_BPM,
+    userBpm: DEFAULT_BPM,
+    anchorTime: Math.min(1.0, Math.max(0.25, duration / 4)),
+    waveform: new Float32Array(1000).fill(0.1),
+    trimRange: { start: 0, end: duration > 0 ? duration : 1 },
+    // rawChannelData 已移出 React 状态：降级时无需注册 PCM
+  };
 }
 
 /**
@@ -177,7 +188,24 @@ export const ImportStep: React.FC<ImportStepProps> = ({
   });
 
   /**
-   * Android 原生通道选片：获取持久化 content:// URI、本地流式代理地址与流式音轨分析
+   * 通道换片时释放旧 URL 占用的资源：blob 对象 URL 撤销 + PCM 注册表条目清除。
+   * （原生代理 URL 无需 revoke，但其 PCM 注册表条目最高数十 MB，必须显式释放）
+   */
+  const releasePreviousChannelUrl = (index: 1 | 2, nextUrl: string) => {
+    const prevUrl = activeBlobUrlsRef.current[index];
+    if (prevUrl && prevUrl !== nextUrl) {
+      if (prevUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(prevUrl);
+      }
+      dropPcm(prevUrl);
+    }
+    activeBlobUrlsRef.current[index] = nextUrl;
+  };
+
+  /**
+   * Android 原生通道选片：获取持久化 content:// URI、本地流式代理地址与流式音轨分析。
+   * 原生 MediaMetadataRetriever 解析失败时字段为 0（未知），此处复用 Web 探测器
+   * 经本地流式代理二次探测，杜绝假 1920×1080 默认值污染几何标定数学。
    */
   const handleNativePick = async (index: 1 | 2) => {
     if (pickingRef.current) return;
@@ -189,16 +217,16 @@ export const ImportStep: React.FC<ImportStepProps> = ({
       }
 
       const url = picked.streamUrl;
-      const dur = picked.duration && picked.duration > 0 ? picked.duration : 10;
+      releasePreviousChannelUrl(index, url);
       const baseItem: LoadedVideoItem = {
         nativeUri: picked.uri,
         url,
         name: picked.name || `视频${index}.mp4`,
-        duration: dur,
+        duration: picked.duration && picked.duration > 0 ? picked.duration : 0,
         spatialTouched: false,
         audioAnchorTouched: false,
-        width: picked.width && picked.width > 0 ? picked.width : 1920,
-        height: picked.height && picked.height > 0 ? picked.height : 1080,
+        width: picked.width && picked.width > 0 ? picked.width : 0,
+        height: picked.height && picked.height > 0 ? picked.height : 0,
         geometry: createDefaultGeometry(),
       };
 
@@ -209,57 +237,59 @@ export const ImportStep: React.FC<ImportStepProps> = ({
         setVideo2(baseItem);
         onUpdateVideo2?.(baseItem);
       }
-      setChannelLoading(index, 'meta', false);
+
+      // 元数据缺字段（原生解析失败回退 0）时经代理流二次探测补齐
+      if (baseItem.duration <= 0 || baseItem.width <= 0 || baseItem.height <= 0) {
+        setChannelLoading(index, 'meta', true);
+        const meta = await probeVideoMetadata(url, probeHostRef.current);
+        applyChannelPatch(index, url, {
+          width: meta.width > 0 ? meta.width : baseItem.width,
+          height: meta.height > 0 ? meta.height : baseItem.height,
+          duration: meta.duration > 0 ? meta.duration : baseItem.duration,
+        });
+        setChannelLoading(index, 'meta', false);
+      }
+
       setChannelLoading(index, 'audio', true);
+      let resolvedDuration = baseItem.duration;
 
       try {
         const audioRes = await NativeMedia.extractAudioAnalysis({ uri: picked.uri });
-        let updatedAudio: VideoAudioInfo;
 
         if (audioRes.hasAudio && audioRes.pcmUrl) {
           const decoded = await decodeAudioFromNativePcmUrl(
             audioRes.pcmUrl,
             audioRes.sampleRate,
-            audioRes.duration || dur
+            audioRes.duration || resolvedDuration
           );
-          const finalDur = decoded.duration || dur;
-          updatedAudio = {
+          const finalDur = decoded.duration || resolvedDuration;
+          resolvedDuration = finalDur;
+          // PCM 移入模块级注册表，避免数十 MB 数据常驻 React 状态
+          putPcm(url, decoded.rawChannelData);
+          const updatedAudio: VideoAudioInfo = {
             duration: finalDur,
             sampleRate: decoded.sampleRate,
+            hasAudioTrack: true,
+            audioDegraded: false,
+            // 超过原生 10 分钟提取上限：BPM/波形来自真实片段（非占位），但显式
+            // 标记截断，UI 据此提示“测速仅覆盖前 10 分钟”
+            audioTruncated: Boolean(audioRes.truncated),
             detectedBpm: decoded.detectedBpm,
             userBpm: decoded.detectedBpm,
-            anchorTime: Math.min(1.0, finalDur / 4),
+            anchorTime: Math.min(1.0, Math.max(0.25, finalDur / 4)),
             waveform: decoded.waveform,
             trimRange: { start: 0, end: finalDur },
-            rawChannelData: decoded.rawChannelData,
           };
+          applyChannelPatch(index, url, { audioInfo: updatedAudio, duration: finalDur });
         } else {
-          updatedAudio = {
-            duration: dur,
-            sampleRate: 16000,
-            detectedBpm: 160,
-            userBpm: 160,
-            anchorTime: Math.min(1.0, dur / 4),
-            waveform: new Float32Array(1000).fill(0.1),
-            trimRange: { start: 0, end: dur },
-            rawChannelData: new Float32Array(0),
-          };
+          // 原生侧确认无音轨（或提取被截断降级），显式标记占位 BPM
+          const fallback = buildDegradedAudioInfo(resolvedDuration);
+          applyChannelPatch(index, url, { audioInfo: fallback });
         }
-
-        applyChannelPatch(index, url, { audioInfo: updatedAudio });
         setChannelLoading(index, 'audio', false);
       } catch {
-        const fallbackAudio: VideoAudioInfo = {
-          duration: dur,
-          sampleRate: 16000,
-          detectedBpm: 160,
-          userBpm: 160,
-          anchorTime: Math.min(1.0, dur / 4),
-          waveform: new Float32Array(1000).fill(0.2),
-          trimRange: { start: 0, end: dur },
-          rawChannelData: new Float32Array(0),
-        };
-        applyChannelPatch(index, url, { audioInfo: fallbackAudio });
+        const fallback = buildDegradedAudioInfo(resolvedDuration);
+        applyChannelPatch(index, url, { audioInfo: fallback });
         setChannelLoading(index, 'audio', false);
       }
     } finally {
@@ -269,7 +299,7 @@ export const ImportStep: React.FC<ImportStepProps> = ({
 
   /**
    * Web 端读取用户选择的本地视频文件
-   * 采用「乐观即时挂载 + 异步元数据/音轨并行探测」策略，彻底消除老旧内核卡死与因果倒置
+   * 采用「乐观即时挂载 + 异步元数据/音轨并行探测」策略，消除老旧内核卡死与因果倒置
    */
   const handleFileChange = async (
     e: React.ChangeEvent<HTMLInputElement>,
@@ -281,22 +311,19 @@ export const ImportStep: React.FC<ImportStepProps> = ({
     if (!file) return;
 
     const url = URL.createObjectURL(file);
-    const prevUrl = activeBlobUrlsRef.current[index];
-    if (prevUrl && prevUrl.startsWith('blob:') && prevUrl !== url) {
-      URL.revokeObjectURL(prevUrl);
-    }
-    activeBlobUrlsRef.current[index] = url;
+    releasePreviousChannelUrl(index, url);
 
     // 1. 乐观即时挂载：一旦拿到 File 对象立即更新卡片 UI，消除界面假死与「未载入」停滞
+    //    未知字段一律用 0 哨兵（不再使用 10/1920 魔法占位）
     const baseItem: LoadedVideoItem = {
       file,
       url,
       name: file.name,
-      duration: 10,
+      duration: 0,
       spatialTouched: false,
       audioAnchorTouched: false,
-      width: 1920,
-      height: 1080,
+      width: 0,
+      height: 0,
       geometry: createDefaultGeometry(),
     };
 
@@ -321,40 +348,34 @@ export const ImportStep: React.FC<ImportStepProps> = ({
       return meta;
     });
 
-    // 3. 异步解码音轨 PCM 并测算初始 BPM（带防 OOM 与 FileReader 兜底）
+    // 3. 异步解码音轨 PCM 并测算初始 BPM（超限/失败时显式降级，不静默伪造）
     const audioPromise = (async () => {
-      try {
-        const audioData = await decodeAudioFromFile(file);
-        const meta = await metaPromise.catch(() => ({ duration: audioData.duration }));
+      const audioData = await decodeAudioFromFile(file);
+      const meta = await metaPromise.catch(() => ({ duration: 0 }));
+      const mergedDuration = audioData.duration || meta.duration || 0;
+
+      if (audioData.hasAudioTrack && !audioData.audioDegraded) {
+        putPcm(url, audioData.rawChannelData);
         const updatedAudio: VideoAudioInfo = {
-          duration: audioData.duration || meta.duration,
+          duration: mergedDuration,
           sampleRate: audioData.sampleRate,
+          hasAudioTrack: true,
+          audioDegraded: false,
           detectedBpm: audioData.detectedBpm,
           userBpm: audioData.detectedBpm,
-          anchorTime: Math.min(1.0, (audioData.duration || meta.duration) / 4),
+          anchorTime: Math.min(1.0, Math.max(0.25, mergedDuration / 4)),
           waveform: audioData.waveform,
-          trimRange: { start: 0, end: audioData.duration || meta.duration },
-          rawChannelData: audioData.rawChannelData,
+          trimRange: { start: 0, end: mergedDuration },
         };
-
-        applyChannelPatch(index, url, { audioInfo: updatedAudio });
-        setChannelLoading(index, 'audio', false);
-      } catch {
-        const meta = await metaPromise.catch(() => ({ duration: 10 }));
-        const fallbackAudio: VideoAudioInfo = {
-          duration: meta.duration,
-          sampleRate: 44100,
-          detectedBpm: 160,
-          userBpm: 160,
-          anchorTime: Math.min(1.0, meta.duration / 4),
-          waveform: new Float32Array(1000).fill(0.2),
-          trimRange: { start: 0, end: meta.duration },
-          rawChannelData: new Float32Array(44100 * 2).fill(0),
-        };
-
-        applyChannelPatch(index, url, { audioInfo: fallbackAudio });
-        setChannelLoading(index, 'audio', false);
+        applyChannelPatch(index, url, {
+          audioInfo: updatedAudio,
+          duration: mergedDuration,
+        });
+      } else {
+        const fallback = buildDegradedAudioInfo(mergedDuration);
+        applyChannelPatch(index, url, { audioInfo: fallback, duration: mergedDuration });
       }
+      setChannelLoading(index, 'audio', false);
     })();
 
     // 两条异步探测均已在内部自消化异常，此处使用 ES2015 Promise.all 即可兼容全系 WebView
@@ -374,6 +395,9 @@ export const ImportStep: React.FC<ImportStepProps> = ({
     const chCode = `视频${index}`;
     const badgeClass = index === 1 ? 'ch1' : 'ch2';
     const loadedClass = item ? (index === 1 ? 'loaded-ch1' : 'loaded-ch2') : '';
+    const audio = item?.audioInfo;
+    const degraded = Boolean(audio?.audioDegraded);
+    const truncated = !degraded && Boolean(audio?.audioTruncated);
 
     return (
       <div
@@ -441,8 +465,10 @@ export const ImportStep: React.FC<ImportStepProps> = ({
                       <Loader2 size={12} className="spin" />
                       <span>探测中</span>
                     </span>
-                  ) : (
+                  ) : item.width > 0 ? (
                     `${item.width}×${item.height}`
+                  ) : (
+                    <span className="mono-muted">未知</span>
                   )}
                 </div>
               </div>
@@ -454,8 +480,10 @@ export const ImportStep: React.FC<ImportStepProps> = ({
                       <Loader2 size={12} className="spin" />
                       <span>计算中</span>
                     </span>
-                  ) : (
+                  ) : item.duration > 0 ? (
                     `${item.duration.toFixed(2)}s`
+                  ) : (
+                    <span className="mono-muted">未知</span>
                   )}
                 </div>
               </div>
@@ -466,6 +494,24 @@ export const ImportStep: React.FC<ImportStepProps> = ({
                     <span className="control-group fx-row-4" style={{ color: 'var(--accent)' }}>
                       <Loader2 size={12} className="spin" />
                       <span>解析中</span>
+                    </span>
+                  ) : degraded ? (
+                    <span
+                      className="control-group fx-row-4"
+                      style={{ color: 'var(--text-muted)' }}
+                      title="音频解析失败或超限，BPM 为占位值：请在标定步骤手动输入或 TAP 测速"
+                    >
+                      <AlertTriangle size={12} />
+                      <span>{audio?.detectedBpm ?? '--'} 占位</span>
+                    </span>
+                  ) : truncated ? (
+                    <span
+                      className="control-group fx-row-4"
+                      style={{ color: 'var(--text-muted)' }}
+                      title="音频超过原生提取安全上限，测速与波形仅基于前 10 分钟真实数据"
+                    >
+                      <AlertTriangle size={12} />
+                      <span>{audio?.detectedBpm ?? '--'} 截断</span>
                     </span>
                   ) : (
                     `${item.audioInfo?.detectedBpm ?? '--'} BPM`

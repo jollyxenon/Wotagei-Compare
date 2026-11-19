@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "verify": "tsx src/core/geometry.verify.ts && tsx src/core/timeline.verify.ts && tsx src/core/audio.verify.ts && tsx src/core/sync-engine.verify.ts && tsx src/core/metronome.verify.ts && tsx src/core/renderer.verify.ts && tsx src/core/exporter.verify.ts && tsx src/core/preferences.verify.ts && tsx src/core/updater.verify.ts",
+    "test": "npm run verify",
     "package:desktop": "node scripts/package-desktop.mjs"
   },
   "dependencies": {
@@ -25,6 +27,7 @@
     "@types/react-dom": "^19.0.4",
     "@vitejs/plugin-react": "^4.3.4",
     "playwright": "^1.65.0",
+    "tsx": "^4.19.2",
     "typescript": "^5.8.2",
     "vite": "^6.2.0"
   }

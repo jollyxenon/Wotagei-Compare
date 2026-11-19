@@ -49,7 +49,7 @@ Wotagei-Compare 把这件事收拢成一套纯本地的横屏工作流：选好�
 - **Android 客户端（推荐）**：前往 [GitHub Releases](https://github.com/jollyxenon/Wotagei-Compare/releases) 下载最新 APK 安装，支持 Android 6.0（API 23）及以上设备。
 - **Web 浏览器端**：支持在桌面或移动端现代浏览器中直接运行（见下方本地开发说明）。
 
-> **平台能力说明**：Android 原生端通过流式解码与硬件管线支持 >80 MB 大体积高清视频的完整波形解析与高速 MP4 导出，并兼容至 Android 10（Chrome 70+ 级别系统 WebView）。纯 Web 浏览器端为防止标签页内存溢出，对超过 80 MB 的本地视频会跳过全量波形解码（使用默认 BPM 占位，可手动输入或 Tap 测速），且浏览器离线导出 MP4 依赖 WebCodecs 支持（不支持的浏览器会自动降级为 WebM 实时录制）。
+> **平台能力说明**：Android 原生端通过流式解码与硬件管线支持 >80 MB 大体积高清视频的完整波形解析与高速 MP4 导出，并兼容至 Android 10（Chrome 70+ 级别系统 WebView）。纯 Web 浏览器端为防止标签页内存溢出，对超过 80 MB 的本地视频会跳过全量波形解码（界面会明示 BPM 为占位值，可手动输入或 Tap 测速），且浏览器离线导出 MP4 依赖 WebCodecs 支持——不支持的浏览器将直接提示无法离线导出，建议改用最新版 Chrome 或 Android 原生客户端。
 
 ### 使用流程
 
@@ -106,14 +106,8 @@ cd android
 # 静态类型与 ES2018 标准库边界检查
 npx tsc --noEmit
 
-# 运行前端核心模块验证脚本（几何投影、时间轴交集、BPM 检测、同步状态机、节拍器、渲染与导出）
-npx tsx src/core/geometry.verify.ts
-npx tsx src/core/timeline.verify.ts
-npx tsx src/core/audio.verify.ts
-npx tsx src/core/sync-engine.verify.ts
-npx tsx src/core/metronome.verify.ts
-npx tsx src/core/renderer.verify.ts
-npx tsx src/core/exporter.verify.ts
+# 一键运行全部前端核心模块验证脚本（几何投影、时间轴交集、BPM 检测、同步状态机、节拍器、渲染、导出、偏好与更新器）
+npm test
 
 # 运行 Android 原生层单元测试
 cd android && ./gradlew testDebugUnitTest

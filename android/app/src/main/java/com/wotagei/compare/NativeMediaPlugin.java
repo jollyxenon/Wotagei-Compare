@@ -227,9 +227,12 @@ public class NativeMediaPlugin extends Plugin {
                 }
             } catch (Exception ignored) {}
 
-            int width = 1920;
-            int height = 1080;
-            double duration = 10.0;
+            // 元数据未知哨兵统一为 0：解析失败时绝不回退伪造的 1920×1080 / 10s
+            // 默认值（假尺寸会静默污染前端整套三线几何标定数学），
+            // 前端收到 0 字段后会经本地流式代理二次探测补齐。
+            int width = 0;
+            int height = 0;
+            double duration = 0.0;
 
             MediaMetadataRetriever retriever = new MediaMetadataRetriever();
             try {
@@ -239,8 +242,8 @@ public class NativeMediaPlugin extends Plugin {
                 String rotStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION);
                 String durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
 
-                int rawW = wStr != null ? Integer.parseInt(wStr) : 1920;
-                int rawH = hStr != null ? Integer.parseInt(hStr) : 1080;
+                int rawW = wStr != null ? Integer.parseInt(wStr) : 0;
+                int rawH = hStr != null ? Integer.parseInt(hStr) : 0;
                 int rot = rotStr != null ? Integer.parseInt(rotStr) : 0;
 
                 if (rot == 90 || rot == 270) {
@@ -258,7 +261,7 @@ public class NativeMediaPlugin extends Plugin {
                     }
                 }
             } catch (Exception ignored) {
-                // 元数据解析失败时回退标准默认参数
+                // 解析失败保持 0（未知），交由前端经代理流二次探测
             } finally {
                 try {
                     retriever.release();
@@ -298,6 +301,7 @@ public class NativeMediaPlugin extends Plugin {
 
                 JSObject res = new JSObject();
                 res.put("hasAudio", ext.hasAudio);
+                res.put("truncated", ext.truncated);
                 res.put("sampleRate", ext.sampleRate);
                 res.put("duration", ext.durationSec);
                 if (ext.hasAudio && ext.pcmInt16Le.length > 0) {

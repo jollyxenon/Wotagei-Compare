@@ -143,6 +143,19 @@ function Get-TabParam($Request) {
   return $tab
 }
 
+# 判断请求是否来自跨站页面：现代浏览器对所有 fetch/sendBeacon 均携带
+# Sec-Fetch-Site 头（same-origin / same-site / cross-site）。
+# 该头缺失（如本启动器自身的 Invoke-WebRequest、老浏览器）时放行；
+# 显式标记为 cross-site 的控制端点请求一律拒绝，防止任意网页伪造
+# 心跳/下线信号杀掉本地服务。
+function Test-CrossSiteRequest($Request) {
+  $secFetchSite = $Request.Headers['Sec-Fetch-Site']
+  if ($null -ne $secFetchSite -and $secFetchSite -eq 'cross-site') {
+    return $true
+  }
+  return $false
+}
+
 # 处理单次 HTTP 请求并维护活跃标签页状态表
 function Handle-Request($Context, [string]$DistDir, [string]$IndexPath, [hashtable]$Tabs, [ref]$HasEverHadTab, [ref]$EmptySinceUtc) {
   $req = $Context.Request
@@ -156,6 +169,10 @@ function Handle-Request($Context, [string]$DistDir, [string]$IndexPath, [hashtab
   }
 
   if ($rawPath -eq '/__wotagei_hb') {
+    if (Test-CrossSiteRequest $req) {
+      Send-BytesResponse $resp 403 'text/plain; charset=utf-8' ([System.Text.Encoding]::UTF8.GetBytes('Forbidden'))
+      return
+    }
     $tabId = Get-TabParam $req
     $Tabs[$tabId] = [DateTime]::UtcNow
     $HasEverHadTab.Value = $true
@@ -165,6 +182,10 @@ function Handle-Request($Context, [string]$DistDir, [string]$IndexPath, [hashtab
   }
 
   if ($rawPath -eq '/__wotagei_bye') {
+    if (Test-CrossSiteRequest $req) {
+      Send-BytesResponse $resp 403 'text/plain; charset=utf-8' ([System.Text.Encoding]::UTF8.GetBytes('Forbidden'))
+      return
+    }
     $tabId = Get-TabParam $req
     $Tabs.Remove($tabId) | Out-Null
     if ($HasEverHadTab.Value -and $Tabs.Count -eq 0 -and $null -eq $EmptySinceUtc.Value) {
@@ -180,8 +201,10 @@ function Handle-Request($Context, [string]$DistDir, [string]$IndexPath, [hashtab
   }
 
   # 防止路径穿越离开 dist 根目录
+  # 前缀比较必须以目录分隔符结尾：否则 "C:\x\dist-backup\..." 这类同前缀
+  # 兄弟目录会绕过 StartsWith 检查
   $relativePath = $decodedPath.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
-  $fullDistRoot = [System.IO.Path]::GetFullPath($DistDir)
+  $fullDistRoot = [System.IO.Path]::GetFullPath($DistDir).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
   $targetPath = [System.IO.Path]::GetFullPath((Join-Path $fullDistRoot $relativePath))
 
   if (-not $targetPath.StartsWith($fullDistRoot, [System.StringComparison]::OrdinalIgnoreCase)) {

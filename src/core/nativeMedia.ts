@@ -16,6 +16,8 @@ export interface NativePickVideoResult {
 
 export interface NativeExtractAudioResult {
   hasAudio: boolean;
+  /** true = 达到原生提取安全上限（10 分钟），PCM/BPM 仅基于截取片段 */
+  truncated?: boolean;
   sampleRate: number;
   duration: number;
   pcmUrl?: string;

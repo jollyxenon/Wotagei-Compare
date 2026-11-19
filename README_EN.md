@@ -49,7 +49,7 @@ Wotagei-Compare turns that workflow into a focused offline tool: load two local 
 - **Android App (Recommended)**: Download the latest APK from [GitHub Releases](https://github.com/jollyxenon/Wotagei-Compare/releases). Supports Android 6.0 (API 23) and above.
 - **Web Browser**: Runs in modern desktop and mobile browsers for previewing or local development.
 
-> **Platform Notes**: The native Android build uses streaming audio extraction and hardware GPU encoding to handle large high-bitrate videos (>80 MB) and older system WebViews (such as Android 10 / Chrome 70+ WebViews) without memory issues. In pure Web browsers, files larger than 80 MB skip full PCM decoding to prevent tab out-of-memory crashes (falling back to a default BPM that you can adjust via Tap or manual input), and fast offline MP4 encoding requires WebCodecs support (automatically falling back to real-time WebM recording when unavailable).
+> **Platform Notes**: The native Android build uses streaming audio extraction and hardware GPU encoding to handle large high-bitrate videos (>80 MB) and older system WebViews (such as Android 10 / Chrome 70+ WebViews) without memory issues. In pure Web browsers, files larger than 80 MB skip full PCM decoding to prevent tab out-of-memory crashes (the UI clearly marks the BPM as a placeholder value that you can adjust via Tap or manual input), and fast offline MP4 encoding requires WebCodecs support — browsers without WebCodecs will report an explicit error instead of exporting; use a recent Chrome or the Android native client instead.
 
 ### Workflow
 

@@ -1,6 +1,10 @@
 /**
- * 音频 PCM 解码、波形提取与能量自相关 BPM 检测纯函数算法
+ * 音频波形提取与能量自相关 BPM 检测纯函数算法
+ * 本文件只包含与 DOM 无关的纯计算，可被 Node 端 verify 脚本直接验证；
+ * 依赖 window/FileReader 等浏览器环境的解码入口位于 audio-dom.ts。
  */
+
+import { DEFAULT_BPM } from '../types/timeline.ts';
 
 /**
  * 提取归一化音频波形峰值数据，供 UI Canvas 快速绘制
@@ -78,8 +82,8 @@ export function detectBpmFromPcm(
   const winSize = Math.max(hopSize, Math.round(sampleRate / 100)); // ~10ms 重叠 RMS 窗
 
   if (!channelData || scanSamples < sampleRate || scanSamples < winSize + hopSize * 10) {
-    // 音频过短不足 1 秒，返回默认典型 160 BPM
-    return 160;
+    // 音频过短不足 1 秒，返回默认典型占位 BPM
+    return DEFAULT_BPM;
   }
 
   // 1. 提取高分辨率 (~250Hz / ~4ms) 局部 RMS 能量包络，避免粗网格量化阶跃
@@ -161,7 +165,7 @@ export function detectBpmFromPcm(
   };
 
   // 3.1 全域粗扫描（步长 0.5 BPM）
-  let bestBpm = 160;
+  let bestBpm = DEFAULT_BPM;
   let bestScore = -Infinity;
   for (let bpm = minBpm; bpm <= maxBpm; bpm += 0.5) {
     const score = scoreCandidateBpm(bpm);
@@ -171,7 +175,7 @@ export function detectBpmFromPcm(
     }
   }
 
-  if (bestScore === -Infinity) return 160;
+  if (bestScore === -Infinity) return DEFAULT_BPM;
 
   // 4. 谐波共振校验：若粗峰落入 95~125 BPM (常见 1.5 拍亚谐波)，复核其 1.5 倍频
   if (bestBpm >= 95 && bestBpm <= 125) {
@@ -224,9 +228,21 @@ export function detectBpmFromPcm(
     }
   }
 
-  // 6. 倍频折叠兜底
+  // 6. 倍频折叠兜底（去先验比较）：粗峰 < 100 BPM 时与 2 倍频候选比较
+  // 「纯梳状自相关得分」（剔除 WOTA 速度先验权重）。若直接比较混合得分，
+  // 168 中心先验在 95/190 处的权重差约 14 倍，会淹没原始自相关的判断，
+  // 使真实慢速曲目（如 90 BPM 抒情曲）依然必被折叠成 180。
+  // 去先验后：真实慢速曲目在 1T 与 2T 处自相关接近持平（严格 > 不折叠）；
+  // 半频误检（真 168 被粗扫判为 84）的 2T 峰值通常高于 1T，正确折叠。
   if (calculatedBpm < 100) {
-    calculatedBpm *= 2;
+    const rawScore = (bpm: number) => {
+      const prior = calculateTempoPriorWeight(bpm);
+      return prior > 0 ? scoreCandidateBpm(bpm) / prior : scoreCandidateBpm(bpm);
+    };
+    const doubledBpm = Math.min(maxBpm, calculatedBpm * 2);
+    if (rawScore(doubledBpm) > rawScore(calculatedBpm)) {
+      calculatedBpm = doubledBpm;
+    }
   } else if (calculatedBpm > 220) {
     calculatedBpm /= 2;
   }
@@ -240,14 +256,14 @@ export function detectBpmFromPcm(
  * @param sampleRate 采样率 (Hz)
  * @param startSec 起始时间戳 (秒)
  * @param endSec 结束时间戳 (秒)
- * @param fallbackBpm 切片过短（< 2.0s）时的保底/当前 BPM（默认 160）
+ * @param fallbackBpm 切片过短（< 2.0s）时的保底/当前 BPM（默认 DEFAULT_BPM）
  */
 export function detectBpmFromSlice(
   pcm: Float32Array,
   sampleRate: number,
   startSec: number,
   endSec: number,
-  fallbackBpm = 160
+  fallbackBpm = DEFAULT_BPM
 ): number {
   if (!pcm || pcm.length === 0 || sampleRate <= 0) return fallbackBpm;
 
@@ -269,167 +285,6 @@ export function detectBpmFromSlice(
   const slice = pcm.subarray(alignedStart, alignedEnd);
   // 切片计算严格闭环在区间内部，不设向后截断限制
   return detectBpmFromPcm(slice, sampleRate);
-}
-
-/**
- * 跨老旧与现代内核安全读取文件的 ArrayBuffer (优先使用 file.arrayBuffer，老旧内核回退至 FileReader)
- */
-export function readFileAsArrayBuffer(file: Blob | File): Promise<ArrayBuffer> {
-  if (typeof file.arrayBuffer === 'function') {
-    return file.arrayBuffer();
-  }
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (reader.result instanceof ArrayBuffer) {
-        resolve(reader.result);
-      } else {
-        reject(new Error('FileReader 读取二进制失败'));
-      }
-    };
-    reader.onerror = () => reject(reader.error || new Error('FileReader 发生读取错误'));
-    reader.readAsArrayBuffer(file);
-  });
-}
-
-/**
- * 跨老旧与现代内核安全解码音频数据 (兼容现代 Promise 与老旧 WebKit/Chromium 回调模式)
- */
-export function safeDecodeAudioData(
-  audioCtx: AudioContext,
-  arrayBuffer: ArrayBuffer
-): Promise<AudioBuffer> {
-  return new Promise((resolve, reject) => {
-    let hasResolved = false;
-    const onSuccess = (buf: AudioBuffer) => {
-      if (!hasResolved) {
-        hasResolved = true;
-        resolve(buf);
-      }
-    };
-    const onError = (err: unknown) => {
-      if (!hasResolved) {
-        hasResolved = true;
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
-    };
-
-    try {
-      const res = audioCtx.decodeAudioData(arrayBuffer, onSuccess, onError);
-      if (res && typeof res.then === 'function') {
-        res.then(onSuccess).catch(onError);
-      }
-    } catch (e) {
-      onError(e);
-    }
-  });
-}
-
-/**
- * 从本地视频/音频 File 对象中解码出单声道 PCM 数据并执行分析
- */
-export async function decodeAudioFromFile(file: File): Promise<{
-  duration: number;
-  sampleRate: number;
-  detectedBpm: number;
-  waveform: Float32Array;
-  rawChannelData: Float32Array;
-}> {
-  // 防 OOM 熔断保护：移动端 WebView 限制 80MB 防止沙箱内存溢出；桌面端浏览器放宽至 512MB
-  const isMobileUa =
-    typeof navigator !== 'undefined' &&
-    /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-  const maxAudioDecodeBytes = (isMobileUa ? 80 : 512) * 1024 * 1024;
-  if (file.size > maxAudioDecodeBytes) {
-    const fallbackDuration = 60;
-    const sampleRate = 44100;
-    return {
-      duration: fallbackDuration,
-      sampleRate,
-      detectedBpm: 160,
-      waveform: new Float32Array(1000).fill(0.2),
-      rawChannelData: new Float32Array(sampleRate * 2),
-    };
-  }
-
-  const arrayBuffer = await readFileAsArrayBuffer(file);
-  // 借助浏览器 AudioContext 解码容器中的音频流
-  const AudioCtxConstructor =
-    window.AudioContext ||
-    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-  const audioCtx = new AudioCtxConstructor();
-  const audioBuffer = await safeDecodeAudioData(audioCtx, arrayBuffer);
-
-  const duration = audioBuffer.duration;
-  const sampleRate = audioBuffer.sampleRate;
-
-  // 合并为单声道 Float32Array
-  const numChannels = audioBuffer.numberOfChannels;
-  const length = audioBuffer.length;
-  const monoData = new Float32Array(length);
-
-  if (numChannels === 1) {
-    monoData.set(audioBuffer.getChannelData(0));
-  } else {
-    const ch0 = audioBuffer.getChannelData(0);
-    const ch1 = audioBuffer.getChannelData(1);
-    for (let i = 0; i < length; i++) {
-      monoData[i] = (ch0[i] + ch1[i]) / 2;
-    }
-  }
-
-  // 初次导入默认对前 60 秒音频进行先验自相关分析，兼顾整曲速度与加载流畅度
-  const detectedBpm = detectBpmFromPcm(monoData, sampleRate, 60);
-  const waveform = extractAudioWaveform(monoData, 1000);
-
-  await audioCtx.close();
-
-  return {
-    duration,
-    sampleRate,
-    detectedBpm,
-    waveform,
-    rawChannelData: monoData,
-  };
-}
-
-/**
- * 从 Android 原生本地流式代理拉取降采样后的 Int16 小端 PCM 数据并完成波形与 BPM 分析
- */
-export async function decodeAudioFromNativePcmUrl(
-  pcmUrl: string,
-  sampleRate: number,
-  durationSec: number
-): Promise<{
-  duration: number;
-  sampleRate: number;
-  detectedBpm: number;
-  waveform: Float32Array;
-  rawChannelData: Float32Array;
-}> {
-  const response = await fetch(pcmUrl);
-  if (!response.ok) {
-    throw new Error('原生音频 PCM 读取失败: HTTP ' + response.status);
-  }
-  const buffer = await response.arrayBuffer();
-  const int16 = new Int16Array(buffer);
-  const float32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) {
-    float32[i] = int16[i] / 32768.0;
-  }
-
-  const effectiveRate = sampleRate > 0 ? sampleRate : 16000;
-  const effectiveDuration = durationSec > 0 ? durationSec : float32.length / effectiveRate;
-  const detectedBpm = detectBpmFromPcm(float32, effectiveRate, 60);
-  const waveform = extractAudioWaveform(float32, 1000);
-
-  return {
-    duration: effectiveDuration,
-    sampleRate: effectiveRate,
-    detectedBpm,
-    waveform,
-    rawChannelData: float32,
-  };
 }
 
 /**

@@ -1,8 +1,6 @@
 package com.wotagei.compare;
 
 import android.os.Bundle;
-import android.webkit.WebSettings;
-import android.webkit.WebView;
 import com.getcapacitor.BridgeActivity;
 
 public class MainActivity extends BridgeActivity {
@@ -10,12 +8,10 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(NativeMediaPlugin.class);
         super.onCreate(savedInstanceState);
-
-        // 允许 https://localhost WebView 加载本机 http://127.0.0.1 本地流式视频代理（兼容 Chrome 74 等老内核）
-        WebView webView = getBridge() != null ? getBridge().getWebView() : null;
-        if (webView != null) {
-            WebSettings settings = webView.getSettings();
-            settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-        }
+        // 说明：WebView 页面源已配置为 http://localhost（capacitor.config.ts 的
+        // androidScheme: 'http'），与本地 http://127.0.0.1 流式代理同为 http 源，
+        // 不构成混合内容。因此无需（也不应）再全局开启
+        // WebSettings.MIXED_CONTENT_ALWAYS_ALLOW——该全局开关会放行 WebView 内
+        // 任意 http 子资源，属于不必要的攻击面。
     }
 }

@@ -14,9 +14,11 @@ import {
   type AppPreferences,
   type StepPreset,
 } from './types/preferences.ts';
+import { DEFAULT_BPM } from './types/timeline.ts';
 import type { WizardStep } from './types/wizard.ts';
+import type { LoadedVideoItem } from './types/media.ts';
 import { loadAppPreferences, saveAppPreferences } from './core/preferences.ts';
-import { ImportStep, LoadedVideoItem } from './components/ImportStep.tsx';
+import { ImportStep } from './components/ImportStep.tsx';
 import { CalibrationStep } from './components/CalibrationStep.tsx';
 import { Workbench, HorizontalFlipIcon } from './components/Workbench.tsx';
 import { SettingsAboutPage } from './components/SettingsAboutPage.tsx';
@@ -357,14 +359,16 @@ export default function App(): React.ReactNode {
               {video1 && (
                 <BpmBadge
                   channel={1}
-                  bpm={video1.audioInfo?.userBpm ?? 160}
+                  bpm={video1.audioInfo?.userBpm ?? DEFAULT_BPM}
                   onChange={(newBpm) => {
                     const currentAudio: VideoAudioInfo = video1.audioInfo || {
                       duration: video1.duration || 1,
-                      sampleRate: 44100,
+                      sampleRate: 16000,
+                      hasAudioTrack: false,
+                      audioDegraded: true,
                       detectedBpm: newBpm,
                       userBpm: newBpm,
-                      anchorTime: 1.0,
+                      anchorTime: Math.min(1.0, Math.max(0.25, (video1.duration || 1) / 4)),
                       waveform: new Float32Array(0),
                     };
                     handleAudio1Change({ ...currentAudio, userBpm: newBpm });
@@ -374,14 +378,16 @@ export default function App(): React.ReactNode {
               {video2 && (
                 <BpmBadge
                   channel={2}
-                  bpm={video2.audioInfo?.userBpm ?? 160}
+                  bpm={video2.audioInfo?.userBpm ?? DEFAULT_BPM}
                   onChange={(newBpm) => {
                     const currentAudio: VideoAudioInfo = video2.audioInfo || {
                       duration: video2.duration || 1,
-                      sampleRate: 44100,
+                      sampleRate: 16000,
+                      hasAudioTrack: false,
+                      audioDegraded: true,
                       detectedBpm: newBpm,
                       userBpm: newBpm,
-                      anchorTime: 1.0,
+                      anchorTime: Math.min(1.0, Math.max(0.25, (video2.duration || 1) / 4)),
                       waveform: new Float32Array(0),
                     };
                     handleAudio2Change({ ...currentAudio, userBpm: newBpm }, bpmStrategy, customBpm);
@@ -517,8 +523,13 @@ export default function App(): React.ReactNode {
               ): LoadedVideoItem => ({
                 ...(prev && prev.url === incoming.url ? prev : incoming),
                 ...incoming,
+                // 时长合并规则：优先采用已知的真实值（> 0），0 表示尚未探测完成（未知哨兵）；
+                // 双方均已知时以较新的 incoming 为准。此前与 Java 默认值耦合的
+                // `prev.duration !== 10` 魔法数判断已随 0 哨兵机制废除。
                 duration:
-                  prev && prev.url === incoming.url && prev.duration !== 10
+                  incoming.duration > 0
+                    ? incoming.duration
+                    : prev && prev.url === incoming.url && prev.duration > 0
                     ? prev.duration
                     : incoming.duration,
                 audioInfo:

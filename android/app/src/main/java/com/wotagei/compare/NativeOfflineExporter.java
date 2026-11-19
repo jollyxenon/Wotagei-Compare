@@ -471,14 +471,14 @@ public class NativeOfflineExporter {
         try {
             // 1. 初始化 H.264 硬件编码器（失败时自动降档至 16 对齐安全分辨率 960x544）
             try {
-                videoEncoder = createAndStartVideoEncoder(encWidth, encHeight, fps, 5_000_000);
+                videoEncoder = configureVideoEncoder(encWidth, encHeight, fps, 5_000_000);
             } catch (Exception primaryEx) {
                 if (videoEncoder != null) {
                     try { videoEncoder.release(); } catch (Exception ignored) {}
                 }
                 encWidth = 960;
                 encHeight = 544;
-                videoEncoder = createAndStartVideoEncoder(encWidth, encHeight, fps, 3_500_000);
+                videoEncoder = configureVideoEncoder(encWidth, encHeight, fps, 3_500_000);
             }
 
             Surface inputSurface = videoEncoder.createInputSurface();
@@ -533,7 +533,10 @@ public class NativeOfflineExporter {
                 }
             }
 
-            // 预计算节拍器节拍序列（与 metronome.ts 完全同源）
+            // 预计算节拍器节拍序列。
+            // 注意：此处脉冲包络/频率与前端 metronome.ts 保持同构设计，但限幅实现不同——
+            // Java 侧用 tanh 软限幅（synthesizeAudioChunkBytes 尾部），Web 侧用
+            // DynamicsCompressor 节点。两者听感相近，并非逐样本一致，跨端导出音色存在轻微差异。
             double beatIntervalTau = params.effectiveBpm > 0 ? (60.0 / params.effectiveBpm) : 0.5;
             int kStart = (int) Math.ceil(params.exportStartTau / beatIntervalTau - 1e-5);
             int kEnd = (int) Math.floor(params.exportEndTau / beatIntervalTau + 1e-5);
@@ -675,6 +678,15 @@ public class NativeOfflineExporter {
                 eosGuard++;
             }
 
+            // EOS 排空超时（编码器停滞约 3 秒仍未送出结束标志）必须显式失败：
+            // 若继续 muxer.stop() 落盘，用户会拿到无声/断尾的“成功”导出残片。
+            if (!videoOutputDone || (hasAudioTrack && !audioOutputDone)) {
+                throw new IOException(
+                    "硬件编码器排空超时，导出已中止（视频轨完成: " + videoOutputDone
+                    + ", 音频轨完成: " + (!hasAudioTrack || audioOutputDone) + "）"
+                );
+            }
+
             if (muxerStarted[0]) {
                 muxer.stop();
             }
@@ -709,7 +721,11 @@ public class NativeOfflineExporter {
         }
     }
 
-    private static MediaCodec createAndStartVideoEncoder(int width, int height, int fps, int bitrate) throws IOException {
+    /**
+     * 按给定参数配置（但不 start）H.264 硬件编码器。
+     * start 必须推迟到 createInputSurface() 之后，故方法名不再谎称 "AndStart"。
+     */
+    private static MediaCodec configureVideoEncoder(int width, int height, int fps, int bitrate) throws IOException {
         MediaFormat fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
         fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);

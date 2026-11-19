@@ -451,6 +451,17 @@ export class DualVideoSyncEngine {
 
     const loopStart = this.loopInterval?.start ?? this.timeline.intersectInterval.start;
     const loopEnd = this.loopInterval?.end ?? this.timeline.intersectInterval.end;
+
+    // 零宽/近零宽区间防护：无有效重叠时步进循环会在起播帧立即触发回绕，
+    // 造成 seek 风暴。此时退化为静态定位到区间起点并保持暂停。
+    if (loopEnd - loopStart < 0.02) {
+      this.intendedPlaying = false;
+      this.isStartingPlay = false;
+      this.onPlayingChange?.(false);
+      this.seekToTau(loopStart, undefined, false);
+      return;
+    }
+
     let clampedTau = Math.max(loopStart, Math.min(loopEnd - 0.05, targetTau));
 
     this.currentTau = clampedTau;

@@ -172,6 +172,7 @@ public class LocalRangeProxyServer {
             }
 
             String rangeHeader = null;
+            String hostHeader = null;
             String line;
             while ((line = readLine(rawIn)) != null && !line.isEmpty()) {
                 int colon = line.indexOf(':');
@@ -179,8 +180,20 @@ public class LocalRangeProxyServer {
                     String name = line.substring(0, colon).trim().toLowerCase();
                     if ("range".equals(name)) {
                         rangeHeader = line.substring(colon + 1).trim();
+                    } else if ("host".equals(name)) {
+                        hostHeader = line.substring(colon + 1).trim();
                     }
                 }
+            }
+
+            // Host 头校验：仅接受指向本机回环地址的请求。服务虽仅绑定 127.0.0.1，
+            // 该校验可将安全边界显式化，并防御经上层代理转发或 DNS 重绑定类误用。
+            // 说明：Android 上 127.0.0.1 为全设备共享，随机 token 是访问控制主体，
+            // 此处为纵深防御层而非唯一防线。
+            if (hostHeader == null
+                    || !(hostHeader.startsWith("127.0.0.1") || hostHeader.startsWith("localhost"))) {
+                writeSimpleStatus(out, "403 Forbidden");
+                return;
             }
 
             if ("OPTIONS".equals(method)) {

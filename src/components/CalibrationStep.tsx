@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useMemo } from 'react';
 import {
   Play,
   Pause,
@@ -15,8 +15,10 @@ import type {
   VideoGeometryConfig,
 } from '../types/geometry.ts';
 import type { VideoAudioInfo, TimeInterval } from '../types/timeline.ts';
-import type { LoadedVideoItem } from './ImportStep.tsx';
+import { DEFAULT_BPM } from '../types/timeline.ts';
+import type { LoadedVideoItem } from '../types/media.ts';
 import { TapTempoTracker, detectBpmFromSlice } from '../core/audio.ts';
+import { getPcm, hasPcm } from '../core/pcmStore.ts';
 import { SynthesizedMetronome } from '../core/metronome.ts';
 
 interface CalibrationStepProps {
@@ -57,23 +59,27 @@ export const CalibrationStep: React.FC<CalibrationStepProps> = ({
     height: 480,
   });
 
-  // 音频与时间标定状态
-  const initialAudio: VideoAudioInfo = videoItem.audioInfo || {
-    duration: videoItem.duration,
-    sampleRate: 44100,
-    detectedBpm: 160,
-    userBpm: 160,
-    anchorTime: 1.0,
-    waveform: new Float32Array(1000).fill(0.25),
-    trimRange: { start: 0, end: videoItem.duration > 0 ? videoItem.duration : 1 },
-  };
+  // 音频与时间标定状态（useMemo 避免每次渲染重建对象导致的波形 Canvas 无谓全量重绘）
+  const initialAudio: VideoAudioInfo = useMemo(() => {
+    return videoItem.audioInfo || {
+      duration: videoItem.duration,
+      sampleRate: 16000,
+      hasAudioTrack: false,
+      audioDegraded: true,
+      detectedBpm: DEFAULT_BPM,
+      userBpm: DEFAULT_BPM,
+      anchorTime: Math.min(1.0, Math.max(0.25, videoItem.duration / 4)),
+      waveform: new Float32Array(1000).fill(0.25),
+      trimRange: { start: 0, end: videoItem.duration > 0 ? videoItem.duration : 1 },
+    };
+  }, [videoItem.audioInfo, videoItem.duration]);
   const totalDuration =
     videoItem.duration > 0 ? videoItem.duration : initialAudio.duration || 1;
 
   const [trimStart, setTrimStart] = useState<number>(initialAudio.trimRange?.start ?? 0);
   const [trimEnd, setTrimEnd] = useState<number>(initialAudio.trimRange?.end ?? totalDuration);
   const [draggingHandle, setDraggingHandle] = useState<'start' | 'end' | null>(null);
-  const [bpm, setBpm] = useState<number>(initialAudio.userBpm || 160);
+  const [bpm, setBpm] = useState<number>(initialAudio.userBpm || DEFAULT_BPM);
   const [anchorTime, setAnchorTime] = useState<number>(
     typeof initialAudio.anchorTime === 'number' ? initialAudio.anchorTime : 1.0
   );
@@ -147,7 +153,13 @@ export const CalibrationStep: React.FC<CalibrationStepProps> = ({
     auditionPendingRef.current = { armed: false, anchor: 0, observedPreAnchor: false };
     restoreVideoVolume(true);
   };
-  const hasRealAudio = Boolean(videoItem.audioInfo && videoItem.audioInfo.rawChannelData !== undefined);
+  // 真实音轨 = 显式 hasAudioTrack 标记且 PCM 注册表内确实存在可重算数据
+  const hasRealAudio = Boolean(
+    videoItem.audioInfo &&
+      videoItem.audioInfo.hasAudioTrack &&
+      !videoItem.audioInfo.audioDegraded &&
+      hasPcm(videoItem.url)
+  );
   const syncedHasAudioRef = useRef<boolean>(hasRealAudio);
   const userEditedRef = useRef<{ bpm: boolean; trim: boolean; anchor: boolean }>({
     bpm: false,
@@ -185,13 +197,15 @@ export const CalibrationStep: React.FC<CalibrationStepProps> = ({
     clearAuditionArm();
     const audio = videoItem.audioInfo;
     const dur = videoItem.duration > 0 ? videoItem.duration : audio?.duration || 1;
-    const nextBpm = audio?.userBpm || 160;
+    const nextBpm = audio?.userBpm || DEFAULT_BPM;
     const nextTrimStart = audio?.trimRange?.start ?? 0;
     const nextTrimEnd = audio?.trimRange?.end ?? dur;
     const rawAnchor = typeof audio?.anchorTime === 'number' ? audio.anchorTime : 1.0;
     const nextAnchor = Math.max(nextTrimStart, Math.min(nextTrimEnd, rawAnchor));
 
-    syncedHasAudioRef.current = Boolean(audio && audio.rawChannelData !== undefined);
+    syncedHasAudioRef.current = Boolean(
+      audio && audio.hasAudioTrack && !audio.audioDegraded && hasPcm(videoItem.url)
+    );
     userEditedRef.current = { bpm: false, trim: false, anchor: false };
     userSeekedRef.current = false;
 
@@ -254,7 +268,9 @@ export const CalibrationStep: React.FC<CalibrationStepProps> = ({
   useEffect(() => {
     const audio = videoItem.audioInfo;
     const dur = videoItem.duration > 0 ? videoItem.duration : audio?.duration || 1;
-    const realAudioArrived = Boolean(audio && audio.rawChannelData !== undefined);
+    const realAudioArrived = Boolean(
+      audio && audio.hasAudioTrack && !audio.audioDegraded && hasPcm(videoItem.url)
+    );
 
     if (!realAudioArrived) {
       if (!userEditedRef.current.trim) {
@@ -275,7 +291,7 @@ export const CalibrationStep: React.FC<CalibrationStepProps> = ({
             start: audio.trimRange?.start ?? 0,
             end: audio.trimRange?.end ?? dur,
           };
-      const nextBpm = userEditedRef.current.bpm ? bpm : (audio.userBpm || 160);
+      const nextBpm = userEditedRef.current.bpm ? bpm : (audio.userBpm || DEFAULT_BPM);
       const rawAnchor = userEditedRef.current.anchor
         ? anchorTime
         : (typeof audio.anchorTime === 'number' ? audio.anchorTime : 1.0);
@@ -591,12 +607,11 @@ export const CalibrationStep: React.FC<CalibrationStepProps> = ({
       userBpm: nextBpm,
       anchorTime: clampedAnchor,
       trimRange: activeTrim,
-      rawChannelData: videoItem.audioInfo?.rawChannelData,
     });
   };
 
   const recalculateBpmForTrim = (tStart: number, tEnd: number) => {
-    const pcm = videoItem.audioInfo?.rawChannelData;
+    const pcm = getPcm(videoItem.url);
     const sampleRate = videoItem.audioInfo?.sampleRate || 44100;
     let computedBpm = bpm;
     if (pcm && pcm.length > 0 && sampleRate > 0) {
@@ -1252,7 +1267,7 @@ export const CalibrationStep: React.FC<CalibrationStepProps> = ({
                 className="num-input audio-bpm-input"
                 value={bpm}
                 onChange={(e) => {
-                  const val = Math.max(1, parseInt(e.target.value, 10) || 160);
+                  const val = Math.max(1, parseInt(e.target.value, 10) || DEFAULT_BPM);
                   userEditedRef.current.bpm = true;
                   commitAudioState(val, anchorTime);
                 }}

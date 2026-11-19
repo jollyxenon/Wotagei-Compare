@@ -21,6 +21,7 @@ import type {
   SoundSource,
   TimeInterval,
 } from '../types/timeline.ts';
+import { DEFAULT_BPM } from '../types/timeline.ts';
 import { calculateTriLineAlignment, AlignmentTransform } from '../core/geometry.ts';
 import {
   calculateUnifiedTimeline,
@@ -30,7 +31,7 @@ import {
 import { renderComparisonFrame, ComparisonRenderState } from '../core/renderer.ts';
 import { SynthesizedMetronome } from '../core/metronome.ts';
 import { DualVideoSyncEngine } from '../core/sync-engine.ts';
-import type { LoadedVideoItem } from './ImportStep.tsx';
+import type { LoadedVideoItem } from '../types/media.ts';
 import type { WizardStep } from '../types/wizard.ts';
 import type { StepPreset } from '../types/preferences.ts';
 import { ExportPage } from './ExportPage.tsx';
@@ -205,13 +206,13 @@ export const Workbench: React.FC<WorkbenchProps> = ({
     return calculateUnifiedTimeline(
       {
         duration: video1.duration,
-        bpm: video1.audioInfo?.userBpm || 160,
+        bpm: video1.audioInfo?.userBpm || DEFAULT_BPM,
         anchorTime: a1,
         trimRange: video1.audioInfo?.trimRange,
       },
       {
         duration: video2.duration,
-        bpm: video2.audioInfo?.userBpm || 160,
+        bpm: video2.audioInfo?.userBpm || DEFAULT_BPM,
         anchorTime: a2,
         trimRange: video2.audioInfo?.trimRange,
       },
@@ -240,6 +241,14 @@ export const Workbench: React.FC<WorkbenchProps> = ({
   soundSourceRef.current = soundSource;
   const timelineRef = useRef<UnifiedTimelineResult>(timeline);
   timelineRef.current = timeline;
+
+  // 卸载时释放节拍器底层 AudioContext：浏览器/WebView 对并发 AudioContext 存在
+  // 硬上限（约 6 个），此前缺失该清理会在多次导航往返后令节拍器永久静音且无任何报错。
+  useEffect(() => {
+    return () => {
+      metronomeRef.current.dispose();
+    };
+  }, []);
 
   // 初始化与连接 DualVideoSyncEngine
   useEffect(() => {
@@ -470,12 +479,13 @@ export const Workbench: React.FC<WorkbenchProps> = ({
 
   /**
    * 切换播放与暂停状态 (统一经过会合屏障联合起播)
+   * 双视频有效区间无真实重叠时禁止起播
    */
   const togglePlay = () => {
     captureReadySnapshots();
     if (isPlaying) {
       engineRef.current?.pause();
-    } else {
+    } else if (timeline.hasOverlap) {
       metronomeRef.current.reset(tauRef.current, timeline.effectiveBpm);
       engineRef.current?.playFrom(tauRef.current);
     }
@@ -494,6 +504,7 @@ export const Workbench: React.FC<WorkbenchProps> = ({
    * 从锚点前 1s 快速起播 (原子会合屏障，初相位差严格为 0)
    */
   const playFromPreRoll = () => {
+    if (!timeline.hasOverlap) return;
     const activeBounds = activeLoopRange ?? timeline.intersectInterval;
     const targetTau = Math.max(activeBounds.start, Math.min(activeBounds.end, -1.0));
     metronomeRef.current.reset(targetTau, timeline.effectiveBpm);
@@ -690,6 +701,9 @@ export const Workbench: React.FC<WorkbenchProps> = ({
 
     animId = requestAnimationFrame(renderLoop);
     return () => cancelAnimationFrame(animId);
+    // 依赖按渲染循环实际读取的字段收窄：避免 App 层 audioInfo 等无关状态
+    // 更新引发的视频对象整体身份变化导致引擎循环被无谓重建
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     isExportActive,
     mode,
@@ -699,8 +713,14 @@ export const Workbench: React.FC<WorkbenchProps> = ({
     relativeOpacity,
     viewport,
     timeline,
-    video1,
-    video2,
+    video1.url,
+    video1.width,
+    video1.height,
+    video1.geometry.triLine,
+    video2.url,
+    video2.width,
+    video2.height,
+    video2.geometry.triLine,
   ]);
 
   // 叠加视口单指平移与双指捏合缩放
@@ -1057,7 +1077,9 @@ export const Workbench: React.FC<WorkbenchProps> = ({
           </div>
 
           <span className="mono-muted workbench-range-readout" style={{ minWidth: '94px', textAlign: 'right', fontSize: '11px' }}>
-            {activeLoopRange
+            {!timeline.hasOverlap
+              ? '无重叠区间'
+              : activeLoopRange
               ? `${activeLoopRange.start.toFixed(1)}~${activeLoopRange.end.toFixed(1)}s`
               : `${timeline.intersectInterval.start.toFixed(1)}s~+${timeline.intersectInterval.end.toFixed(1)}s`}
           </span>
@@ -1069,12 +1091,26 @@ export const Workbench: React.FC<WorkbenchProps> = ({
           style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
         >
           <div className="control-group fx-row-4" style={{ flexShrink: 0 }}>
-            <button type="button" onClick={playFromPreRoll} className="btn" style={{ padding: '0 7px' }}>
+            <button
+              type="button"
+              onClick={playFromPreRoll}
+              className="btn"
+              style={{ padding: '0 7px' }}
+              disabled={!timeline.hasOverlap}
+              title={timeline.hasOverlap ? '从锚点前 1 秒起播' : '双视频有效区间无重叠，无法播放'}
+            >
               <Crosshair size={12} />
               <span>锚点前 1s</span>
             </button>
 
-            <button type="button" onClick={togglePlay} className="btn btn-accent" style={{ padding: '0 8px' }}>
+            <button
+              type="button"
+              onClick={togglePlay}
+              className="btn btn-accent"
+              style={{ padding: '0 8px' }}
+              disabled={!timeline.hasOverlap}
+              title={timeline.hasOverlap ? undefined : '双视频有效区间无重叠，无法播放'}
+            >
               {isPlaying ? <Pause size={13} /> : <Play size={13} />}
               <span>{isPlaying ? '暂停' : '播放'}</span>
             </button>
@@ -1314,7 +1350,7 @@ export const Workbench: React.FC<WorkbenchProps> = ({
                       className={`seg-btn ${bpmStrategy === 'left' ? 'active' : ''}`}
                       style={{ padding: '0 6px', fontSize: '11px' }}
                     >
-                      随 视频1 ({video1.audioInfo?.userBpm || 160})
+                      随 视频1 ({video1.audioInfo?.userBpm || DEFAULT_BPM})
                     </button>
                     <button
                       type="button"
@@ -1325,7 +1361,7 @@ export const Workbench: React.FC<WorkbenchProps> = ({
                       className={`seg-btn ${bpmStrategy === 'right' ? 'active' : ''}`}
                       style={{ padding: '0 6px', fontSize: '11px' }}
                     >
-                      随 视频2 ({video2.audioInfo?.userBpm || 160})
+                      随 视频2 ({video2.audioInfo?.userBpm || DEFAULT_BPM})
                     </button>
                     <button
                       type="button"
@@ -1347,7 +1383,7 @@ export const Workbench: React.FC<WorkbenchProps> = ({
                         className="num-input"
                         value={customBpm}
                         onChange={(e) => {
-                          const val = Math.max(1, parseInt(e.target.value, 10) || 160);
+                          const val = Math.max(1, parseInt(e.target.value, 10) || DEFAULT_BPM);
                           onBpmStrategyChange?.('custom', val);
                         }}
                         style={{ width: '56px', height: '22px', fontSize: '11px' }}

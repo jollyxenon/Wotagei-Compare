@@ -367,6 +367,16 @@ public class NativeGlRenderer {
         GLES20.glAttachShader(prog, vs);
         GLES20.glAttachShader(prog, fs);
         GLES20.glLinkProgram(prog);
+        // 链接状态检查：失败时立即抛错，避免携带失效 program 继续运行导致黑帧难排查
+        int[] linkStatus = new int[1];
+        GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, linkStatus, 0);
+        if (linkStatus[0] == 0) {
+            String log = GLES20.glGetProgramInfoLog(prog);
+            GLES20.glDeleteProgram(prog);
+            GLES20.glDeleteShader(vs);
+            GLES20.glDeleteShader(fs);
+            throw new RuntimeException("OpenGL 着色器程序链接失败: " + log);
+        }
         GLES20.glDeleteShader(vs);
         GLES20.glDeleteShader(fs);
         return prog;
@@ -376,6 +386,14 @@ public class NativeGlRenderer {
         int shader = GLES20.glCreateShader(type);
         GLES20.glShaderSource(shader, src);
         GLES20.glCompileShader(shader);
+        // 编译状态检查：驱动不支持/上下文异常时抛出含日志的错误而非静默失败
+        int[] compiled = new int[1];
+        GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0);
+        if (compiled[0] == 0) {
+            String log = GLES20.glGetShaderInfoLog(shader);
+            GLES20.glDeleteShader(shader);
+            throw new RuntimeException("着色器编译失败 (type=" + type + "): " + log);
+        }
         return shader;
     }
 

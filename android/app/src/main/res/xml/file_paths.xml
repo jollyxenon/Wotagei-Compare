@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <external-path name="my_images" path="." />
-    <cache-path name="my_cache_images" path="." />
+    <!-- 仅暴露 cacheDir：端内更新 APK 下载即存放于此。
+         原 Capacitor 模板遗留的 external-path path="." 会将整个外部存储根
+         纳入 FileProvider 可共享范围，属于未使用且过度的授权，已移除。 -->
+    <cache-path name="internal_cache" path="." />
 </paths>

@@ -1,16 +1,22 @@
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
-const ADB = process.env.ADB_PATH || '/mnt/d/Scoop/apps/android-clt/current/platform-tools/adb.exe';
+// adb 路径可移植化：优先读 ADB_PATH 环境变量，否则假定 adb 已在 PATH 上。
+// （此前默认值硬编码了开发机私有路径 /mnt/d/Scoop/...）
+const ADB = process.env.ADB_PATH || 'adb';
 const SERIAL = process.env.ANDROID_SERIAL || 'emulator-5554';
 const APK_PATH = path.resolve('android/app/build/outputs/apk/debug/app-debug.apk');
+const IS_WSL =
+  process.platform === 'linux' && fs.readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft');
 
 /**
- * 将 WSL 路径转换为 Windows 路径供 Windows 版 adb.exe 使用
+ * 在 WSL 内运行时将 POSIX 路径转换为 Windows 路径供 Windows 版 adb.exe 使用
  */
-function toWinPath(wslPath) {
-  return execSync(`wslpath -w "${wslPath}"`, { encoding: 'utf8' }).trim();
+function toWinPath(p) {
+  if (!IS_WSL) return p;
+  return execSync(`wslpath -w "${p}"`, { encoding: 'utf8' }).trim();
 }
 
 /**
@@ -21,14 +27,13 @@ function adb(cmd) {
 }
 
 /**
- * 截取模拟器屏幕并拉取到 /tmp/
+ * 截取模拟器屏幕并拉取到系统临时目录
  */
 function screencap(name) {
-  const tmpWin = `C:\\\\Users\\\\Xenon\\\\AppData\\\\Local\\\\Temp\\\\${name}.png`;
-  const tmpWsl = `/mnt/c/Users/Xenon/AppData/Local/Temp/${name}.png`;
+  const tmpDir = os.tmpdir();
+  const tmpFile = path.join(tmpDir, `${name}.png`);
   adb(`shell screencap -p /sdcard/${name}.png`);
-  adb(`pull /sdcard/${name}.png "${tmpWin}"`);
-  fs.copyFileSync(tmpWsl, `/tmp/${name}.png`);
+  adb(`pull /sdcard/${name}.png "${toWinPath(tmpFile)}"`);
 }
 
 /**
@@ -39,10 +44,10 @@ function ensureTestVideos() {
   if (check.includes('test_ch1.mp4') && check.includes('test_ch2.mp4')) {
     return;
   }
-  const ch1 = '/tmp/test_ch1.mp4';
-  const ch2 = '/tmp/test_ch2.mp4';
+  const ch1 = path.join(os.tmpdir(), 'test_ch1.mp4');
+  const ch2 = path.join(os.tmpdir(), 'test_ch2.mp4');
   if (!fs.existsSync(ch1) || !fs.existsSync(ch2)) {
-    throw new Error('缺少测试视频 /tmp/test_ch1.mp4 或 /tmp/test_ch2.mp4，请先生成后再巡检');
+    throw new Error(`缺少测试视频 ${ch1} 或 ${ch2}，请先生成后再巡检`);
   }
   adb(`push "${toWinPath(ch1)}" /sdcard/Movies/test_ch1.mp4`);
   adb(`push "${toWinPath(ch2)}" /sdcard/Movies/test_ch2.mp4`);
@@ -73,8 +78,8 @@ async function run() {
   const devices = execSync(`${ADB} devices`, { encoding: 'utf8' });
   if (!devices.includes(`${SERIAL}\tdevice`)) {
     throw new Error(
-      `未检测到在线模拟器 ${SERIAL}。请先启动：\n` +
-        'D:\\Scoop\\apps\\android-clt\\current\\emulator\\emulator.exe -avd legacy_android10 -gpu host -no-boot-anim'
+      `未检测到在线模拟器 ${SERIAL}。请先通过 Android Studio 或 emulator 命令行启动目标设备 ` +
+        '（例：emulator -avd <名称> -gpu host -no-boot-anim）'
     );
   }
 
@@ -96,8 +101,9 @@ async function run() {
   adb(`forward tcp:9222 localabstract:${sock}`);
 
   const targets = await fetch('http://127.0.0.1:9222/json/list').then((r) => r.json());
-  const target = targets.find((p) => p.url.startsWith('https://localhost'));
-  assert(Boolean(target), '未找到 https://localhost WebView 页面');
+  // Capacitor 页面源现为 http://localhost（androidScheme: 'http'），保持对新旧 scheme 的兼容
+  const target = targets.find((p) => p.url.startsWith('http://localhost') || p.url.startsWith('https://localhost'));
+  assert(Boolean(target), '未找到 localhost WebView 页面');
 
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((res, rej) => {
